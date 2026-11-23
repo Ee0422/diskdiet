@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "diskdiet"
-version = "0.1.0"
+version = "0.2.0"
 description = "Free up disk space safely: find old node_modules, venvs, caches, duplicates and big files, tidy your Downloads, with undo."
 readme = "README.md"
 license = "MIT"
