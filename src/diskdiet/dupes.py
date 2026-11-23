@@ -60,15 +60,33 @@ class DupeGroup:
         return min(self.paths, key=lambda p: (mtime(p), len(str(p)), str(p)))
 
 
+# on_progress(step, done, total, current_path); total is 0 while still unknown.
+Progress = Callable[[int, int, int, str], None]
+
+
+def _noop(step: int, done: int, total: int, path: str) -> None:
+    pass
+
+
 def find_duplicates(
     root: Path,
     min_size: int = 1024 * 1024,
-    on_progress: Callable[[str], None] | None = None,
+    on_progress: Progress | None = None,
 ) -> list[DupeGroup]:
-    """Return groups of identical files under ``root``, most wasted space first."""
+    """Return groups of identical files under ``root``, most wasted space first.
+
+    Reports progress in three steps: 1 list files, 2 quick compare, 3 full compare.
+    """
+    report = on_progress or _noop
+
+    # Step 1: list files, grouped by size
     by_size: dict[int, list[str]] = defaultdict(list)
     seen_inodes: set[tuple[int, int]] = set()
+    seen = 0
     for entry in iter_files(root):
+        seen += 1
+        if seen % 200 == 0:
+            report(1, seen, 0, entry.path)
         try:
             st = entry.stat(follow_symlinks=False)
         except OSError:
@@ -88,33 +106,43 @@ def find_duplicates(
                 continue
             seen_inodes.add(key)
         by_size[st.st_size].append(entry.path)
+    report(1, seen, seen, "")
 
-    groups: list[DupeGroup] = []
-    for size, paths in by_size.items():
-        if len(paths) < 2:
-            continue
+    # Step 2: same size -> compare the first 64 KB
+    same_size = [(size, paths) for size, paths in by_size.items() if len(paths) >= 2]
+    total = sum(len(paths) for _, paths in same_size)
+    done = 0
+    head_groups: list[tuple[int, list[str]]] = []
+    for size, paths in same_size:
         by_head: dict[str, list[str]] = defaultdict(list)
         for p in paths:
-            if on_progress:
-                on_progress(p)
             digest = _hash(p, _HEAD)
+            done += 1
+            report(2, done, total, p)
             if digest:
                 by_head[digest].append(p)
-        for head_paths in by_head.values():
-            if len(head_paths) < 2:
-                continue
-            if size <= _HEAD:
-                # The head hash already covered the whole file.
-                groups.append(DupeGroup(size, sorted(Path(p) for p in head_paths)))
-                continue
-            by_full: dict[str, list[str]] = defaultdict(list)
-            for p in head_paths:
-                digest = _hash(p)
-                if digest:
-                    by_full[digest].append(p)
-            for full_paths in by_full.values():
-                if len(full_paths) >= 2:
-                    groups.append(DupeGroup(size, sorted(Path(p) for p in full_paths)))
+        head_groups.extend((size, hp) for hp in by_head.values() if len(hp) >= 2)
+
+    # Step 3: same start -> compare whole files
+    groups: list[DupeGroup] = []
+    need_full = [(size, hp) for size, hp in head_groups if size > _HEAD]
+    total = sum(len(hp) for _, hp in need_full)
+    done = 0
+    for size, head_paths in head_groups:
+        if size <= _HEAD:
+            # The head hash already covered the whole file.
+            groups.append(DupeGroup(size, sorted(Path(p) for p in head_paths)))
+            continue
+        by_full: dict[str, list[str]] = defaultdict(list)
+        for p in head_paths:
+            digest = _hash(p)
+            done += 1
+            report(3, done, total, p)
+            if digest:
+                by_full[digest].append(p)
+        for full_paths in by_full.values():
+            if len(full_paths) >= 2:
+                groups.append(DupeGroup(size, sorted(Path(p) for p in full_paths)))
 
     groups.sort(key=lambda g: g.wasted, reverse=True)
     return groups
@@ -127,10 +155,17 @@ class BigFile:
     mtime: float
 
 
-def find_big_files(root: Path, min_size: int, limit: int = 50) -> list[BigFile]:
+def find_big_files(
+    root: Path,
+    min_size: int,
+    limit: int = 50,
+    on_progress: Callable[[int, str], None] | None = None,
+) -> list[BigFile]:
     """The largest files under ``root`` that are at least ``min_size`` bytes."""
     found: list[BigFile] = []
-    for entry in iter_files(root):
+    for n, entry in enumerate(iter_files(root), 1):
+        if on_progress and n % 200 == 0:
+            on_progress(n, entry.path)
         try:
             st = entry.stat(follow_symlinks=False)
         except OSError:

@@ -141,11 +141,18 @@ def project_last_touched(project: Path, ignore: Path) -> float:
     return newest
 
 
-def find_junk_paths(root: Path) -> Iterator[tuple[Path, Rule]]:
-    """Walk ``root`` and yield every matching folder (without measuring it)."""
+def find_junk_paths(
+    root: Path, on_dir: Callable[[str], None] | None = None
+) -> Iterator[tuple[Path, Rule]]:
+    """Walk ``root`` and yield every matching folder (without measuring it).
+
+    ``on_dir`` is called with each folder as it is searched, for progress display.
+    """
     stack = [str(root)]
     while stack:
         current = stack.pop()
+        if on_dir:
+            on_dir(current)
         try:
             with os.scandir(current) as entries:
                 subdirs = [e for e in entries if e.is_dir(follow_symlinks=False)]
@@ -164,24 +171,50 @@ def find_junk_paths(root: Path) -> Iterator[tuple[Path, Rule]]:
             stack.append(entry.path)
 
 
+class ScanProgress:
+    """Callbacks a caller can override to show what the scan is doing."""
+
+    def searching(self, folder: str, folders_checked: int, found: int) -> None:
+        """Step 1: called for every folder searched."""
+
+    def measuring(self, done: int, total: int, folder: Path, bytes_so_far: int) -> None:
+        """Step 2: called after each leftover folder is measured."""
+
+
 def scan_junk(
     root: Path,
     min_age_days: float = 0,
-    on_found: Callable[[Path], None] | None = None,
+    progress: ScanProgress | None = None,
 ) -> list[JunkFolder]:
     """Find and measure junk folders, biggest first.
 
+    Works in two steps: first search for candidate folders, then measure them.
     ``min_age_days`` keeps only projects nobody has touched for that long.
     """
-    results: list[JunkFolder] = []
-    for folder, rule in find_junk_paths(root):
-        if on_found:
-            on_found(folder)
+    progress = progress or ScanProgress()
+
+    # Step 1: search
+    candidates: list[tuple[Path, Rule, float]] = []
+    checked = 0
+
+    def on_dir(folder: str) -> None:
+        nonlocal checked
+        checked += 1
+        progress.searching(folder, checked, len(candidates))
+
+    for folder, rule in find_junk_paths(root, on_dir=on_dir):
         last = project_last_touched(folder.parent, folder)
         age = age_seconds(last) if last else 0.0
-        if age < min_age_days * 86400:
-            continue
+        if age >= min_age_days * 86400:
+            candidates.append((folder, rule, age))
+
+    # Step 2: measure
+    results: list[JunkFolder] = []
+    total_bytes = 0
+    for i, (folder, rule, age) in enumerate(candidates, 1):
         size, files = dir_size(folder)
+        total_bytes += size
+        progress.measuring(i, len(candidates), folder, total_bytes)
         if size == 0:
             continue
         results.append(JunkFolder(folder, rule.kind, size, files, age))

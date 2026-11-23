@@ -5,16 +5,25 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+)
 from rich.table import Table
 
 from . import __version__
-from .dupes import find_big_files, find_duplicates
+from .cache import load_scan, save_scan
+from .dupes import DupeGroup, find_big_files, find_duplicates
 from .fsutil import age_seconds, human_age, human_size, parse_selection, parse_size
-from .junk import JunkFolder, scan_junk
+from .junk import JunkFolder, ScanProgress, scan_junk
 from .tidy import apply_tidy, plan_tidy, undo_last
 
 console = Console(highlight=False)
@@ -79,12 +88,80 @@ def _root(arg: str | None) -> Path:
 # -------------------------------------------------------------- junk folders
 
 
-def _scan(root: Path, older_than: float) -> list[JunkFolder]:
-    with console.status(f"Looking for leftovers in {root} ...") as status:
-        def found(folder: Path) -> None:
-            status.update(f"Measuring [dim]{_short(folder, root)}[/]")
+class _LiveScanProgress(ScanProgress):
+    """Shows "Step 1 of 2: searching" then "Step 2 of 2: measuring" with live numbers."""
 
-        return scan_junk(root, min_age_days=older_than, on_found=found)
+    def __init__(self, progress: Progress, root: Path) -> None:
+        self.progress = progress
+        self.root = root
+        self.search = progress.add_task("Step 1 of 2: searching folders", total=None,
+                                        info="", count="")
+        self.measure: TaskID | None = None
+        self._last = 0.0
+
+    def searching(self, folder: str, folders_checked: int, found: int) -> None:
+        self.checked, self.found = folders_checked, found
+        now = time.monotonic()
+        if now - self._last < 0.1:  # redrawing on every folder would slow us down
+            return
+        self._last = now
+        where = _short(Path(folder), self.root)
+        self.progress.update(
+            self.search,
+            info=f"{folders_checked:,} folders checked, {found} leftovers found "
+                 f"[dim]{_clip(where)}[/]",
+        )
+
+    def finish_search(self) -> None:
+        self.progress.update(
+            self.search, total=1, completed=1,
+            info=f"[green]done:[/] {self.checked:,} folders checked, "
+                 f"{_plural(self.found, 'leftover')} found",
+        )
+
+    def measuring(self, done: int, total: int, folder: Path, bytes_so_far: int) -> None:
+        if self.measure is None:
+            self.finish_search()
+            self.measure = self.progress.add_task("Step 2 of 2: measuring sizes",
+                                                  total=total, info="", count="")
+        self.progress.update(
+            self.measure,
+            completed=done,
+            count=f"{done}/{total}",
+            info=f"{human_size(bytes_so_far)} so far [dim]{_clip(_short(folder, self.root))}[/]",
+        )
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n:,} {word}{'' if n == 1 else 's'}"
+
+
+def _clip(text: str, width: int = 40) -> str:
+    return text if len(text) <= width else "..." + text[-(width - 3):]
+
+
+def _progress() -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]{task.description}"),
+        BarColumn(bar_width=24),
+        TextColumn("{task.fields[count]}", style="cyan"),
+        TextColumn("{task.fields[info]}"),
+        console=console,
+        transient=False,
+    )
+
+
+def _scan(root: Path, older_than: float) -> list[JunkFolder]:
+    console.print(f"Looking for leftovers in [bold]{root}[/]")
+    with _progress() as progress:
+        live = _LiveScanProgress(progress, root)
+        items = scan_junk(root, min_age_days=older_than, progress=live)
+        if live.measure is None:  # nothing found, so step 2 never started
+            live.finish_search()
+    console.print()
+    save_scan(root, older_than, items)
+    return items
 
 
 def _junk_table(items: list[JunkFolder], root: Path) -> Table:
@@ -107,36 +184,63 @@ def _junk_table(items: list[JunkFolder], root: Path) -> Table:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     root = _root(args.path)
-    items = _scan(root, args.older_than)
     if args.json:
+        items = scan_junk(root, min_age_days=args.older_than)
+        save_scan(root, args.older_than, items)
         print(json.dumps([
             {"path": str(i.path), "kind": i.kind, "bytes": i.size, "files": i.files,
              "project_untouched_days": round(i.project_age / 86400, 1)}
             for i in items
         ], indent=2))
         return 0
+    items = _scan(root, args.older_than)
     if not items:
         console.print("[green]Nothing to clean here.[/] Your projects are tidy.")
         return 0
     console.print(_junk_table(items, root))
     total = sum(i.size for i in items)
-    console.print(f"\n[bold]{len(items)} folders, {human_size(total)} you could free.[/]")
-    console.print("All of these are re-created automatically when you next build or "
-                  "install. Run [bold]diskdiet clean[/] to pick what to remove.")
+    console.print(
+        f"\n[bold]{_plural(len(items), 'folder')}, {human_size(total)} you could free.[/]"
+    )
+    console.print("All of these are re-created automatically when you next build or install.")
+    if sys.stdin.isatty() and _confirm("\nPick some to clean now?"):
+        return _clean_items(items, root, yes=False, dry_run=False)
+    console.print("Run [bold]diskdiet clean[/] any time in the next hour to pick what to "
+                  "remove, without scanning again.")
     return 0
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
     root = _root(args.path)
-    items = _scan(root, args.older_than)
+    cached = None if args.rescan else load_scan(root, args.older_than)
+    if cached is not None:
+        items, age = cached
+        console.print(f"Using your scan from {_ago(age)}. "
+                      "[dim](Add --rescan to search again.)[/]\n")
+    else:
+        items = _scan(root, args.older_than)
     if not items:
         console.print("[green]Nothing to clean here.[/]")
         return 0
     console.print(_junk_table(items, root))
     total = sum(i.size for i in items)
-    console.print(f"\n{len(items)} folders, {human_size(total)} in total.")
+    console.print(f"\n{_plural(len(items), 'folder')}, {human_size(total)} in total.")
+    return _clean_items(items, root, yes=args.yes, dry_run=args.dry_run,
+                        older_than=args.older_than)
 
-    if args.yes:
+
+def _ago(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "just now"
+    return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+
+
+def _clean_items(
+    items: list[JunkFolder], root: Path, yes: bool, dry_run: bool, older_than: float = 0
+) -> int:
+    """Ask which of ``items`` to remove, then move them to the Trash."""
+    if yes:
         picked = list(range(len(items)))
     else:
         picked = _ask_selection(len(items), "\nWhich ones? (e.g. 1,3,5-7 / all / none): ")
@@ -145,24 +249,35 @@ def cmd_clean(args: argparse.Namespace) -> int:
         console.print("Nothing removed.")
         return 0
     size = sum(c.size for c in chosen)
-    if args.dry_run:
-        console.print(f"[yellow]Dry run:[/] would move {len(chosen)} folders "
+    if dry_run:
+        console.print(f"[yellow]Dry run:[/] would move {_plural(len(chosen), 'folder')} "
                       f"({human_size(size)}) to the Trash.")
         return 0
-    if not args.yes and not _confirm(
-        f"Move {len(chosen)} folders ({human_size(size)}) to the Trash?"
+    if not yes and not _confirm(
+        f"Move {_plural(len(chosen), 'folder')} ({human_size(size)}) to the Trash?"
     ):
         console.print("Nothing removed.")
         return 0
-    with console.status("Moving to Trash ..."):
-        ok, failed = _trash([c.path for c in chosen])
+
+    failed: list[tuple[Path, str]] = []
+    with _progress() as progress:
+        task = progress.add_task("Moving to Trash", total=len(chosen), info="", count="")
+        for n, c in enumerate(chosen, 1):
+            progress.update(task, count=f"{n}/{len(chosen)}",
+                            info=f"[dim]{_clip(_short(c.path, root))}[/]")
+            _, fails = _trash([c.path])
+            failed.extend(fails)
+            progress.advance(task)
+        progress.update(task, info="[green]done[/]")
     for path, reason in failed:
         err.print(f"[red]Could not remove[/] {path}: {reason}")
-    freed = sum(c.size for c in chosen) - sum(
-        c.size for c in chosen if c.path in {p for p, _ in failed}
-    )
-    console.print(f"[bold green]Done. Freed about {human_size(freed)}[/] "
-                  f"({ok} folders moved to the Trash).")
+    failed_paths = {p for p, _ in failed}
+    removed = [c for c in chosen if c.path not in failed_paths]
+    freed = sum(c.size for c in removed)
+    # Keep the remembered scan in step with what is still on disk.
+    save_scan(root, older_than, [i for i in items if i not in removed])
+    console.print(f"\n[bold green]Done. Freed about {human_size(freed)}[/] "
+                  f"({_plural(len(removed), 'folder')} moved to the Trash).")
     console.print("[dim]Tip: empty your Trash / Recycle Bin to get the space back "
                   "for real, or restore from it if you change your mind.[/]")
     return 1 if failed else 0
@@ -171,14 +286,70 @@ def cmd_clean(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- duplicates
 
 
+_DUPE_STEPS = {
+    1: "Step 1 of 3: listing files",
+    2: "Step 2 of 3: quick compare",
+    3: "Step 3 of 3: full compare",
+}
+
+
+def _dupes_with_progress(root: Path, min_size: int) -> list[DupeGroup]:
+    console.print(f"Looking for duplicate files over {human_size(min_size)} in [bold]{root}[/]")
+    with _progress() as progress:
+        tasks: dict[int, TaskID] = {}
+        last = 0.0
+        files_seen = 0
+
+        def report(step: int, done: int, total: int, path: str) -> None:
+            nonlocal last, files_seen
+            if step == 1:
+                files_seen = done
+            if step not in tasks:
+                for earlier_step, earlier in tasks.items():
+                    msg = "[green]done[/]"
+                    if earlier_step == 1:
+                        msg += f": {_plural(files_seen, 'file')} checked"
+                    progress.update(earlier, info=msg)
+                tasks[step] = progress.add_task(_DUPE_STEPS[step], total=total or None,
+                                                info="", count="")
+            now = time.monotonic()
+            finished = total and done >= total
+            if not finished and now - last < 0.1:
+                return
+            last = now
+            if step == 1:
+                info = f"{done:,} files checked"
+                if finished:
+                    progress.update(tasks[1], total=total, completed=total)
+            else:
+                progress.update(tasks[step], total=total, completed=done,
+                                count=f"{done}/{total}")
+                info = ""
+            if path:
+                info += f" [dim]{_clip(_short(Path(path), root))}[/]"
+            progress.update(tasks[step], info=info)
+
+        groups = find_duplicates(root, min_size=min_size, on_progress=report)
+        for step in (1, 2, 3):  # steps with nothing to do still show as done
+            if step not in tasks:
+                tasks[step] = progress.add_task(_DUPE_STEPS[step], total=1, info="", count="")
+            task = next(t for t in progress.tasks if t.id == tasks[step])
+            done_info = "[green]done[/]"
+            if step == 1:
+                done_info += f": {_plural(files_seen, 'file')} checked"
+            progress.update(tasks[step], total=task.total or 1,
+                            completed=task.total or 1, info=done_info)
+    console.print()
+    return groups
+
+
 def cmd_dupes(args: argparse.Namespace) -> int:
     root = _root(args.path)
     min_size = parse_size(args.min_size)
-    with console.status(f"Comparing files in {root} ...") as status:
-        groups = find_duplicates(
-            root, min_size=min_size,
-            on_progress=lambda p: status.update(f"Checking [dim]{_short(Path(p), root)}[/]"),
-        )
+    if args.json:
+        groups = find_duplicates(root, min_size=min_size)
+    else:
+        groups = _dupes_with_progress(root, min_size)
     if args.json:
         print(json.dumps([
             {"bytes_each": g.size, "wasted_bytes": g.wasted, "keep": str(g.keeper()),
@@ -200,7 +371,7 @@ def cmd_dupes(args: argparse.Namespace) -> int:
             console.print(f"       {mark}{_short(p, root)}")
     wasted = sum(g.wasted for g in groups)
     more = f" (showing the top {len(shown)})" if len(groups) > len(shown) else ""
-    console.print(f"\n[bold]{len(groups)} sets of duplicates, {human_size(wasted)} "
+    console.print(f"\n[bold]{_plural(len(groups), 'set')} of duplicates, {human_size(wasted)} "
                   f"wasted{more}.[/]")
 
     if not args.clean:
@@ -238,8 +409,14 @@ def cmd_dupes(args: argparse.Namespace) -> int:
 def cmd_big(args: argparse.Namespace) -> int:
     root = _root(args.path)
     min_size = parse_size(args.min_size)
-    with console.status(f"Looking for big files in {root} ..."):
-        files = find_big_files(root, min_size, limit=args.limit)
+    with console.status(f"Looking for big files in {root} ...") as status:
+        files = find_big_files(
+            root, min_size, limit=args.limit,
+            on_progress=lambda n, p: status.update(
+                f"Looking for big files: {n:,} files checked "
+                f"[dim]{_clip(_short(Path(p), root))}[/]"
+            ),
+        )
     if args.json:
         print(json.dumps([{"path": str(f.path), "bytes": f.size} for f in files], indent=2))
         return 0
@@ -341,6 +518,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_age(p)
     p.add_argument("--dry-run", action="store_true", help="show what would happen only")
     p.add_argument("-y", "--yes", action="store_true", help="select everything, no questions")
+    p.add_argument("--rescan", action="store_true",
+                   help="search again instead of reusing a scan from the last hour")
     p.set_defaults(func=cmd_clean)
 
     p = sub.add_parser("dupes", help="find duplicate files")

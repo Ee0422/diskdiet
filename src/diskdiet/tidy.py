@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .fsutil import unique_path
+from .fsutil import data_dir, unique_path
 
 CATEGORIES: dict[str, set[str]] = {
     "Images": {
@@ -118,9 +118,7 @@ def plan_tidy(root: Path, older_than_days: float = 0) -> TidyPlan:
 
 
 def history_dir() -> Path:
-    base = os.environ.get("DISKDIET_HOME")
-    path = Path(base) if base else Path.home() / ".diskdiet"
-    return path / "history"
+    return data_dir() / "history"
 
 
 def apply_tidy(plan: TidyPlan) -> tuple[Path, list[Move]]:
