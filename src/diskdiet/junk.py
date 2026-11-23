@@ -9,10 +9,9 @@ merely happens to share a name.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from .fsutil import age_seconds, dir_size, should_skip_dir
 

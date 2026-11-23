@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/Ee0422/diskdiet/actions/workflows/ci.yml"><img src="https://github.com/Ee0422/diskdiet/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey" alt="Windows, macOS, Linux">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a>
 </p>
@@ -35,7 +35,7 @@ pipx install git+https://github.com/Ee0422/diskdiet
 ```
 
 No `pipx`? Use `pip install git+https://github.com/Ee0422/diskdiet` instead.
-Works on Windows, macOS and Linux with Python 3.9 or newer.
+Works on Windows, macOS and Linux with Python 3.10 or newer.
 
 ## Use it
 

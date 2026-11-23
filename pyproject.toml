@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "KHOR EE ZHE" }]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 keywords = ["disk", "cleanup", "node_modules", "duplicates", "downloads", "cli", "disk-space"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -41,7 +41,7 @@ packages = ["src/diskdiet"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
