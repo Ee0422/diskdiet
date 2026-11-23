@@ -8,6 +8,7 @@ full hash. Only files that survive every pass are reported.
 from __future__ import annotations
 
 import hashlib
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -75,6 +76,12 @@ def find_duplicates(
         if st.st_size < min_size:
             continue
         # Hard links already share their data; they are not real duplicates.
+        if not st.st_ino:
+            # On Windows, scandir leaves the file ID empty; a full stat fills it in.
+            try:
+                st = os.stat(entry.path, follow_symlinks=False)
+            except OSError:
+                continue
         if st.st_ino:
             key = (st.st_dev, st.st_ino)
             if key in seen_inodes:
