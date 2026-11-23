@@ -37,6 +37,12 @@ def should_skip_dir(entry: os.DirEntry, parent: str) -> bool:
 _UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
 
 
+def data_dir() -> Path:
+    """Where diskdiet keeps its small records (override with DISKDIET_HOME)."""
+    base = os.environ.get("DISKDIET_HOME")
+    return Path(base) if base else Path.home() / ".diskdiet"
+
+
 def human_size(num_bytes: float) -> str:
     """Format a byte count like ``1.4 GB``."""
     size = float(num_bytes)

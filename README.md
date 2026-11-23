@@ -41,7 +41,8 @@ Works on Windows, macOS and Linux with Python 3.10 or newer.
 
 ```bash
 diskdiet scan                  # what coding leftovers are taking space? (looks in your home folder)
-diskdiet clean                 # pick which ones to remove
+diskdiet clean                 # pick which ones to remove (reuses a scan from the last hour)
+diskdiet clean --rescan        # search again instead of reusing the last scan
 diskdiet clean --older-than 90 # only projects you haven't touched in 3 months
 
 diskdiet dupes                 # find duplicate files
@@ -54,6 +55,19 @@ diskdiet undo                  # put everything back
 
 Every command takes a folder, for example `diskdiet scan ~/code` or `diskdiet tidy D:\Downloads`.
 Add `--dry-run` to see what would happen without changing anything, or `--json` for scripts.
+
+### See what it's doing
+
+Big folders can take a while, so every command shows which step it's on and live numbers:
+
+```
+Looking for leftovers in /Users/you
+  Step 1 of 2: searching folders ━━━━━━━━━━━━━━━━━━━━━━━━        done: 48,210 folders checked, 63 leftovers found
+⠹ Step 2 of 2: measuring sizes   ━━━━━━━━━━━━━━━╺━━━━━━━━ 41/63 17.4 GB so far code/shop-app/node_modules
+```
+
+You don't have to scan twice: when `scan` finishes it offers to clean right away, and
+`diskdiet clean` reuses any scan of the same folder from the last hour.
 
 ### Picking what to clean
 
